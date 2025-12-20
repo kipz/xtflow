@@ -186,15 +186,17 @@
         ;; Get output deltas from leaf operators
         output-deltas (apply concat (vals leaf-outputs))
 
-        ;; Compute new results by applying output deltas to old results
+        ;; Compute new results by applying output deltas to old results with transients
         ;; We'll materialize results by tracking documents
         old-set (set old-results)
-        delta-changes (reduce (fn [s d]
-                                (if (pos? (:mult d))
-                                  (conj s (:doc d))
-                                  (disj s (:doc d))))
-                              old-set
-                              output-deltas)
+        delta-changes (persistent!
+                       (reduce (fn [^clojure.lang.ITransientSet s d]
+                                 (let [mult ^long (:mult d)]
+                                   (if (pos? mult)
+                                     (conj! s (:doc d))
+                                     (disj! s (:doc d)))))
+                               (transient old-set)
+                               output-deltas))
         new-results (vec delta-changes)]
 
     {:old-results old-results

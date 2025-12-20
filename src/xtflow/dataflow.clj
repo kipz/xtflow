@@ -170,8 +170,12 @@
             remaining (rest queue)
             ;; Process operator with deltas (no visited check - multi-input needs multiple passes)
             operator (get-in graph [:operators operator-id])
-            ;; Process each delta through operator
-            output-deltas (mapcat #(propagate-through-operator operator %) deltas)
+            ;; Process each delta through operator with transient for performance
+            output-deltas (persistent!
+                           (reduce (fn [^clojure.lang.ITransientVector acc delta]
+                                     (reduce conj! acc (propagate-through-operator operator delta)))
+                                   (transient [])
+                                   deltas))
             ;; Propagate to downstream
             downstream-map (propagate-to-downstream graph operator-id output-deltas)
             ;; Add downstream work to queue
