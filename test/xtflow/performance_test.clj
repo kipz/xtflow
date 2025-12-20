@@ -381,6 +381,30 @@
     (>= speedup 15) "MEDIUM"
     :else "LOW"))
 
+(defn print-benchmark-result
+  "Print benchmark results in standard format."
+  [title diff-stats naive-stats speedup description]
+  (println "\n" (str/join "" (repeat 80 "=")))
+  (println " BENCHMARK RESULT:" title)
+  (println (str/join "" (repeat 80 "=")))
+  (println description)
+  (println)
+  (println "Differential Approach:")
+  (println (format "  Mean: %s | Median: %s | P95: %s"
+                   (format-time (:mean diff-stats))
+                   (format-time (:median diff-stats))
+                   (format-time (:p95 diff-stats))))
+  (println)
+  (println "Naive Approach (full re-query):")
+  (println (format "  Mean: %s | Median: %s | P95: %s"
+                   (format-time (:mean naive-stats))
+                   (format-time (:median naive-stats))
+                   (format-time (:p95 naive-stats))))
+  (println)
+  (println (format "Speedup: %s (%s benefit)"
+                   (format-speedup speedup)
+                   (benefit-level speedup))))
+
 (defn print-separator
   "Print table separator line."
   [widths]
@@ -1908,3 +1932,1273 @@
 
 ;;; ============================================================================
 ;;; Expression Operator Benchmarks - Comprehensive Coverage
+
+;;; ============================================================================
+;;; Standalone XTQL Operator Benchmarks
+;;; ============================================================================
+
+;;; WHERE Standalone Benchmark
+
+(defn naive-where-filter
+  "Naive implementation: Filter orders by amount > 100."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(> (:amount %) 100) all-orders)]
+    (vec filtered)))
+
+(deftest ^:benchmark benchmark-where-standalone
+  (testing "WHERE operator filtering"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-where"
+              :xtql "(-> (from :orders [order-id user-id amount])
+                         (where (> amount 100)))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-where-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-where-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 2) (str "Expected >2x speedup for WHERE, got " speedup "x"))
+      (print-benchmark-result "WHERE - Filtering" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE amount > 100"))))
+
+;;; UNNEST Standalone Benchmark
+
+(defn naive-unnest
+  "Naive implementation: Un nest SBOM components."
+  [xtdb-client]
+  (let [all-sboms (naive-fetch-all xtdb-client :prod_attestations)
+        unnested (mapcat (fn [sbom]
+                           (map (fn [comp]
+                                  (assoc sbom :component comp))
+                                (:components sbom)))
+                         all-sboms)]
+    (vec unnested)))
+
+(deftest ^:benchmark benchmark-unnest-standalone
+  (testing "UNNEST operator"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-unnest"
+              :xtql "(-> (from :prod_attestations [xt/id predicate components])
+                         (unnest {component components}))"
+              :callback (fn [_changes])})
+
+          initial-sboms (gen-bulk-sboms 5000 0)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :prod_attestations] initial-sboms)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :prod_attestations] initial-sboms)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-sboms 100 100000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :prod_attestations] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :prod_attestations] warmup)])
+                (naive-unnest *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-sboms (gen-bulk-sboms 100 5000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :prod_attestations] new-sboms)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :prod_attestations] new-sboms)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-unnest *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 2) (str "Expected >2x speedup for UNNEST, got " speedup "x"))
+      (print-benchmark-result "UNNEST - Array Flattening" diff-stats naive-stats speedup
+                              "Data: 10K SBOMs with ~300K components\nQuery: UNNEST components"))))
+
+;;; WITH Standalone Benchmark
+
+(defn naive-with-computed
+  "Naive implementation: Add computed fields."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        with-computed (map (fn [order]
+                             (assoc order
+                                    :total-with-tax (* (:amount order) 1.1)
+                                    :category (if (> (:amount order) 500) "high" "low")))
+                           all-orders)]
+    (vec with-computed)))
+
+(deftest ^:benchmark benchmark-with-standalone
+  (testing "WITH operator adding computed fields"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-with"
+              :xtql "(-> (from :orders [order-id amount])
+                         (with {:total-with-tax (* amount 1.1)
+                                :category (if (> amount 500) \"high\" \"low\")}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-with-computed *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-with-computed *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 2) (str "Expected >2x speedup for WITH, got " speedup "x"))
+      (print-benchmark-result "WITH - Computed Fields" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITH computed fields"))))
+
+;;; WITHOUT Standalone Benchmark
+
+(defn naive-without-fields
+  "Naive implementation: Remove specified fields."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        without-fields (map #(dissoc % :user-id) all-orders)]
+    (vec without-fields)))
+
+(deftest ^:benchmark benchmark-without-standalone
+  (testing "WITHOUT operator removing fields"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-without"
+              :xtql "(-> (from :orders [order-id user-id amount])
+                         (without user-id))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-without-fields *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-without-fields *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 2) (str "Expected >2x speedup for WITHOUT, got " speedup "x"))
+      (print-benchmark-result "WITHOUT - Field Removal" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITHOUT user-id"))))
+
+;;; LIMIT Standalone Benchmark
+
+(defn naive-limit
+  "Naive implementation: Take first N rows."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)]
+    (vec (take 100 all-orders))))
+
+(deftest ^:benchmark benchmark-limit-standalone
+  (testing "LIMIT operator"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-limit"
+              :xtql "(-> (from :orders [order-id user-id amount])
+                         (limit 100))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-limit *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-limit *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 2) (str "Expected >2x speedup for LIMIT, got " speedup "x"))
+      (print-benchmark-result "LIMIT - Top N" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: LIMIT 100"))))
+
+;;; OFFSET Standalone Benchmark
+
+(defn naive-offset
+  "Naive implementation: Skip first N rows."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)]
+    (vec (drop 50 all-orders))))
+
+(deftest ^:benchmark benchmark-offset-standalone
+  (testing "OFFSET operator"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-offset"
+              :xtql "(-> (from :orders [order-id user-id amount])
+                         (offset 50))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-offset *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-offset *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 2) (str "Expected >2x speedup for OFFSET, got " speedup "x"))
+      (print-benchmark-result "OFFSET - Skip N" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: OFFSET 50"))))
+
+;;; ============================================================================
+;;; Arithmetic Operator Benchmarks
+;;; ============================================================================
+
+;;; Addition (+) Benchmark
+
+(defn naive-addition-filter
+  "Naive implementation: Filter with addition in WHERE."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(> (+ (:amount %) 50) 150) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-addition
+  (testing "Addition operator (+) in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-addition"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (> (+ amount 50) 150))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-addition-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-addition-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for +, got " speedup "x"))
+      (print-benchmark-result "Operator: +" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE (amount + 50) > 150"))))
+
+;;; Subtraction (-) Benchmark
+
+(defn naive-subtraction-filter
+  "Naive implementation: Filter with subtraction in WHERE."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(> (- (:amount %) 50) 50) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-subtraction
+  (testing "Subtraction operator (-) in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-subtraction"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (> (- amount 50) 50))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-subtraction-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-subtraction-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for -, got " speedup "x"))
+      (print-benchmark-result "Operator: -" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE (amount - 50) > 50"))))
+
+;;; Division (/) Benchmark
+
+(defn naive-division-filter
+  "Naive implementation: Filter with division in WHERE."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(> (/ (:amount %) 2) 50) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-division
+  (testing "Division operator (/) in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-division"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (> (/ amount 2) 50))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-division-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-division-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for /, got " speedup "x"))
+      (print-benchmark-result "Operator: /" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE (amount / 2) > 50"))))
+
+;;; Modulo (mod) Benchmark
+
+(defn naive-mod-filter
+  "Naive implementation: Filter with modulo in WHERE."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(= (mod (:amount %) 10) 0) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-mod
+  (testing "Modulo operator (mod) in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-mod"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (= (mod amount 10) 0))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-mod-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-mod-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for mod, got " speedup "x"))
+      (print-benchmark-result "Operator: mod" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE (amount mod 10) = 0"))))
+
+;;; ============================================================================
+;;; Math Function Benchmarks
+;;; ============================================================================
+
+;;; sqrt Benchmark
+
+(defn naive-sqrt-filter
+  "Naive implementation: Filter with sqrt in WHERE."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(> (Math/sqrt (double (:amount %))) 10) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-sqrt
+  (testing "sqrt function in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-sqrt"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (> (sqrt amount) 10))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-sqrt-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-sqrt-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for sqrt, got " speedup "x"))
+      (print-benchmark-result "Function: sqrt" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE sqrt(amount) > 10"))))
+
+;;; pow Benchmark
+
+(defn naive-pow-filter
+  "Naive implementation: Filter with pow in WHERE."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(> (Math/pow (double (:amount %)) 2) 10000) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-pow
+  (testing "pow function in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-pow"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (> (pow amount 2) 10000))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-pow-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-pow-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for pow, got " speedup "x"))
+      (print-benchmark-result "Function: pow" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE pow(amount, 2) > 10000"))))
+
+;;; abs Benchmark
+
+(defn naive-abs-filter
+  "Naive implementation: Filter with abs in WHERE."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(> (Math/abs (double (- (:amount %) 500))) 100) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-abs
+  (testing "abs function in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-abs"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (> (abs (- amount 500)) 100))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-abs-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-abs-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for abs, got " speedup "x"))
+      (print-benchmark-result "Function: abs" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE abs(amount - 500) > 100"))))
+
+;;; floor Benchmark
+
+(defn naive-floor-with
+  "Naive implementation: Add computed field with floor."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        with-floor (map #(assoc % :floored (Math/floor (double (/ (:amount %) 10)))) all-orders)]
+    {:count (count with-floor)}))
+
+(deftest ^:benchmark benchmark-floor
+  (testing "floor function in WITH"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-floor"
+              :xtql "(-> (from :orders [order-id amount])
+                         (with {:floored (floor (/ amount 10))})
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-floor-with *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-floor-with *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for floor, got " speedup "x"))
+      (print-benchmark-result "Function: floor" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITH floor(amount / 10)"))))
+
+;;; ceil Benchmark
+
+(defn naive-ceil-with
+  "Naive implementation: Add computed field with ceil."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        with-ceil (map #(assoc % :ceiled (Math/ceil (double (/ (:amount %) 10)))) all-orders)]
+    {:count (count with-ceil)}))
+
+(deftest ^:benchmark benchmark-ceil
+  (testing "ceil function in WITH"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-ceil"
+              :xtql "(-> (from :orders [order-id amount])
+                         (with {:ceiled (ceil (/ amount 10))})
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-ceil-with *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-ceil-with *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for ceil, got " speedup "x"))
+      (print-benchmark-result "Function: ceil" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITH ceil(amount / 10)"))))
+
+;;; round Benchmark
+
+(defn naive-round-with
+  "Naive implementation: Add computed field with round."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        with-round (map #(assoc % :rounded (Math/round (double (/ (:amount %) 10)))) all-orders)]
+    {:count (count with-round)}))
+
+(deftest ^:benchmark benchmark-round
+  (testing "round function in WITH"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-round"
+              :xtql "(-> (from :orders [order-id amount])
+                         (with {:rounded (round (/ amount 10))})
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-round-with *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-round-with *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for round, got " speedup "x"))
+      (print-benchmark-result "Function: round" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITH round(amount / 10)"))))
+
+;;; ============================================================================
+;;; String Function Benchmarks
+;;; ============================================================================
+
+;;; Note: String benchmarks use users table with name field
+
+(defn naive-trim-with
+  "Naive implementation: Trim whitespace from names."
+  [xtdb-client]
+  (let [all-users (naive-fetch-all xtdb-client :users)
+        with-trim (map #(assoc % :trimmed (clojure.string/trim (or (:name %) ""))) all-users)]
+    {:count (count with-trim)}))
+
+(deftest ^:benchmark benchmark-trim
+  (testing "trim function in WITH"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-trim"
+              :xtql "(-> (from :users [xt/id name])
+                         (with {:trimmed (trim name)})
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-users (gen-bulk-users 10000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :users] initial-users)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :users] initial-users)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-users 100)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :users] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :users] warmup)])
+                (naive-trim-with *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-users (gen-bulk-users 200)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :users] new-users)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :users] new-users)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-trim-with *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for trim, got " speedup "x"))
+      (print-benchmark-result "Function: trim" diff-stats naive-stats speedup
+                              "Data: 20K users\nQuery: WITH trim(name)"))))
+
+;;; Like-regex Benchmark
+
+(defn naive-like-regex-filter
+  "Naive implementation: Filter with regex pattern."
+  [xtdb-client]
+  (let [all-users (naive-fetch-all xtdb-client :users)
+        filtered (filter #(re-find #"User.*" (or (:name %) "")) all-users)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-like-regex
+  (testing "like-regex function in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-like-regex"
+              :xtql "(-> (from :users [xt/id name])
+                         (where (like-regex name \"User.*\"))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-users (gen-bulk-users 10000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :users] initial-users)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :users] initial-users)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-users 100)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :users] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :users] warmup)])
+                (naive-like-regex-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-users (gen-bulk-users 200)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :users] new-users)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :users] new-users)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-like-regex-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for like-regex, got " speedup "x"))
+      (print-benchmark-result "Function: like-regex" diff-stats naive-stats speedup
+                              "Data: 20K users\nQuery: WHERE like-regex(name, \"User.*\")"))))
+
+;;; ============================================================================
+;;; Control Structure Benchmarks
+;;; ============================================================================
+
+;;; case Benchmark
+
+(defn naive-case-with
+  "Naive implementation: Case expression for tier categorization."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        with-case (map (fn [order]
+                         (assoc order
+                                :category (cond
+                                            (> (:amount order) 500) "premium"
+                                            (> (:amount order) 200) "standard"
+                                            :else "basic")))
+                       all-orders)]
+    {:count (count with-case)}))
+
+(deftest ^:benchmark benchmark-case
+  (testing "case expression in WITH"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-case"
+              :xtql "(-> (from :orders [order-id amount])
+                         (with {:category (case (> amount 500) \"premium\"
+                                                (> amount 200) \"standard\"
+                                                \"basic\")})
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-case-with *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-case-with *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for case, got " speedup "x"))
+      (print-benchmark-result "Control: case" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITH case expression"))))
+
+;;; cond Benchmark
+
+(defn naive-cond-with
+  "Naive implementation: Cond expression for tier categorization."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        with-cond (map (fn [order]
+                         (assoc order
+                                :category (cond
+                                            (> (:amount order) 500) "premium"
+                                            (> (:amount order) 200) "standard"
+                                            :else "basic")))
+                       all-orders)]
+    {:count (count with-cond)}))
+
+(deftest ^:benchmark benchmark-cond
+  (testing "cond expression in WITH"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-cond"
+              :xtql "(-> (from :orders [order-id amount])
+                         (with {:category (cond (> amount 500) \"premium\"
+                                                (> amount 200) \"standard\"
+                                                \"basic\")})
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-cond-with *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-cond-with *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for cond, got " speedup "x"))
+      (print-benchmark-result "Control: cond" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITH cond expression"))))
+
+;;; let Benchmark
+
+(defn naive-let-with
+  "Naive implementation: Let binding for complex calculations."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        with-let (map (fn [order]
+                        (let [subtotal (:amount order)
+                              tax (* subtotal 0.1)
+                              total (+ subtotal tax)]
+                          (assoc order :total total)))
+                      all-orders)]
+    {:count (count with-let)}))
+
+(deftest ^:benchmark benchmark-let
+  (testing "let expression in WITH"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-let"
+              :xtql "(-> (from :orders [order-id amount])
+                         (with {:total (let [:subtotal amount
+                                             :tax (* subtotal 0.1)]
+                                        (+ subtotal tax))})
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-let-with *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-let-with *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for let, got " speedup "x"))
+      (print-benchmark-result "Control: let" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITH let bindings"))))
+
+;;; null-if Benchmark
+
+(defn naive-null-if-with
+  "Naive implementation: null-if for conditional nulls."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        with-null-if (map (fn [order]
+                            (assoc order
+                                   :normalized-amount (if (= (:amount order) 0) nil (:amount order))))
+                          all-orders)]
+    {:count (count with-null-if)}))
+
+(deftest ^:benchmark benchmark-null-if
+  (testing "null-if expression in WITH"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-null-if"
+              :xtql "(-> (from :orders [order-id amount])
+                         (with {:normalized-amount (null-if amount 0)})
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-null-if-with *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-null-if-with *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for null-if, got " speedup "x"))
+      (print-benchmark-result "Control: null-if" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WITH null-if(amount, 0)"))))
+
+;;; ============================================================================
+;;; Predicate Benchmarks
+;;; ============================================================================
+
+;;; nil? Benchmark
+
+(defn naive-nil-check-filter
+  "Naive implementation: Filter with nil? check."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(not (nil? (:amount %))) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-nil-check
+  (testing "nil? predicate in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-nil"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (not (nil? amount)))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-nil-check-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-nil-check-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for nil?, got " speedup "x"))
+      (print-benchmark-result "Predicate: nil?" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE NOT nil?(amount)"))))
+
+;;; != Benchmark
+
+(defn naive-not-equal-filter
+  "Naive implementation: Filter with != operator."
+  [xtdb-client]
+  (let [all-orders (naive-fetch-all xtdb-client :orders)
+        filtered (filter #(not= (:amount %) 100) all-orders)]
+    {:count (count filtered)}))
+
+(deftest ^:benchmark benchmark-not-equal
+  (testing "!= operator in WHERE"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-not-equal"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (!= amount 100))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-not-equal-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-not-equal-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for !=, got " speedup "x"))
+      (print-benchmark-result "Predicate: !=" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE amount != 100"))))
+
+;;; <> Benchmark (alias for !=)
+
+(deftest ^:benchmark benchmark-not-equal-alt
+  (testing "<> operator in WHERE (alias for !=)"
+    (let [diff-timings (atom [])
+          naive-timings (atom [])
+
+          _ (diff/register-query!
+             {:query-id "bench-not-equal-alt"
+              :xtql "(-> (from :orders [order-id amount])
+                         (where (<> amount 100))
+                         (aggregate nil {:count (row-count)}))"
+              :callback (fn [_changes])})
+
+          initial-orders (gen-bulk-orders 10000 0 1000)
+          _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+          _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] initial-orders)])
+
+          _ (dotimes [_ 5]
+              (let [warmup (gen-bulk-orders 100 100000 1000)]
+                (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] warmup)])
+                (naive-not-equal-filter *xtdb-client*)))
+
+          _ (dotimes [_ 50]
+              (let [new-orders (gen-bulk-orders 200 10000 1000)
+                    _ (xt/execute-tx *xtdb-client* [(into [:put-docs :orders] new-orders)])
+                    [_ diff-ms] (with-timing
+                                  (diff/execute-tx! *xtdb-client* [(into [:put-docs :orders] new-orders)]))
+                    [_ naive-ms] (with-timing
+                                   (naive-not-equal-filter *xtdb-client*))]
+                (swap! diff-timings conj diff-ms)
+                (swap! naive-timings conj naive-ms)))
+
+          diff-stats (timing-stats @diff-timings)
+          naive-stats (timing-stats @naive-timings)
+          speedup (/ (:mean naive-stats) (:mean diff-stats))]
+
+      (is (>= speedup 1.5) (str "Expected >1.5x speedup for <>, got " speedup "x"))
+      (print-benchmark-result "Predicate: <>" diff-stats naive-stats speedup
+                              "Data: 20K orders\nQuery: WHERE amount <> 100"))))
+
