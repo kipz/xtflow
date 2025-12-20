@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.1
+
+      - name: Setup Java
+        uses: actions/setup-java@v5.1.0
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: 'latest'
+          clj-kondo: 'latest'
+
+      - name: Cache dependencies
+        uses: actions/cache@v4.3.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.clojure
+            ~/.cpcache
+          key: ${{ runner.os }}-clojure-${{ hashFiles('**/deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-clojure-
+
+      # Enable testcontainers
+      - name: Setup testcontainers
+        run: |
+          echo "TESTCONTAINERS_RYUK_DISABLED=false" >> $GITHUB_ENV
+          echo "TESTCONTAINERS_CHECKS_DISABLE=false" >> $GITHUB_ENV
+
+      # Verify Docker is available
+      - name: Verify Docker
+        run: docker info
+
+      - name: Run clj-kondo linting
+        run: clj-kondo --lint src test examples
+
+      - name: Run tests
+        run: clojure -X:test

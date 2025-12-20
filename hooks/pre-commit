@@ -1,0 +1,26 @@
+#!/bin/bash
+# Pre-commit hook to run clj-kondo linting
+
+echo "Running clj-kondo..."
+
+# Run clj-kondo on staged Clojure files
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(clj|cljs|cljc|edn)$')
+
+if [ -z "$STAGED_FILES" ]; then
+    # No Clojure files staged
+    exit 0
+fi
+
+# Run clj-kondo on staged files
+clj-kondo --lint $STAGED_FILES 2>&1 | tee /dev/tty
+
+# Check exit code
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "❌ clj-kondo found issues. Please fix them before committing."
+    echo "   To skip this check, use: git commit --no-verify"
+    exit 1
+fi
+
+echo "✅ clj-kondo passed"
+exit 0

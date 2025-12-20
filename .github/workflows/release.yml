@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - name: Extract version from tag
+        id: extract
+        run: |
+          TAG_NAME="${{ github.event.release.tag_name }}"
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]]; then
+            echo "Error: Tag must match semantic versioning format (v*.*.* or v*.*.*-suffix)"
+            exit 1
+          fi
+          VERSION="${TAG_NAME#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5.1.0
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: 'latest'
+
+      - name: Cache dependencies
+        uses: actions/cache@v4.3.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.clojure
+            ~/.cpcache
+          key: ${{ runner.os }}-clojure-${{ hashFiles('**/deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-clojure-
+
+      - name: Run tests
+        run: clojure -X:test
+
+      - name: Set version in pom.xml
+        run: |
+          sed -i 's/{{VERSION}}/${{ needs.validate.outputs.version }}/g' pom.xml
+          cat pom.xml
+
+      - name: Build JAR
+        run: |
+          export VERSION=${{ needs.validate.outputs.version }}
+          clojure -T:jar jar
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: jar-artifacts
+          path: target/*.jar
+
+  deploy:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5.1.0
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: 'latest'
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v7.0.0
+        with:
+          name: jar-artifacts
+          path: target/
+
+      - name: Set version in pom.xml
+        run: |
+          sed -i 's/{{VERSION}}/${{ needs.validate.outputs.version }}/g' pom.xml
+
+      - name: Deploy to Clojars
+        env:
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USER }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_DEPLOY_KEY }}
+        run: |
+          export VERSION=${{ needs.validate.outputs.version }}
+          clojure -X:deploy \
+            :artifact '"target/xtflow-'$VERSION'.jar"' \
+            :pom-file '"pom.xml"'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: release-artifacts
+          path: |
+            target/*.jar
+            pom.xml
+
+  attach-assets:
+    needs: [validate, deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7.0.0
+        with:
+          name: release-artifacts
+          path: artifacts/
+
+      - name: Attach artifacts to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${{ needs.validate.outputs.version }}
+
+          gh release upload ${{ github.event.release.tag_name }} \
+            artifacts/target/xtflow-$VERSION.jar \
+            artifacts/pom.xml \
+            --repo ${{ github.repository }}
