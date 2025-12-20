@@ -1376,7 +1376,7 @@
                 (naive-rel-with-join *xtdb-client* inline-data)))
 
           ;; Timed incremental transactions: 50 user updates
-          _ (dotimes [tx-idx 50]
+          _ (dotimes [_ 50]
               (let [;; Update existing users that match inline data
                     user-ids-to-update [5 15 25 35 45]
                     updated-users (vec (for [uid user-ids-to-update]
@@ -1860,7 +1860,7 @@
           _ (diff/execute-tx! *xtdb-client* [(into [:put-docs :users] initial-users)])
 
           ;; Warmup
-          _ (dotimes [i 5]
+          _ (dotimes [_ 5]
               (let [warmup (gen-bulk-users 100)]
                 (xt/execute-tx *xtdb-client* [(into [:put-docs :users] warmup)])
                 (diff/execute-tx! *xtdb-client* [(into [:put-docs :users] warmup)])
