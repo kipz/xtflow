@@ -137,24 +137,23 @@
   Args:
     tx-ops - Transaction operations
 
-  Returns: Sequence of deltas"
+  Returns: Vector of deltas (eager evaluation)"
   [tx-ops]
-  (mapcat (fn [op]
-            (case (first op)
-              :put-docs
-              (let [[_ table & docs] op]
-                (for [doc docs]
-                  (delta/add-delta (assoc doc :xt/table table))))
+  (into []
+        (mapcat (fn [op]
+                  (case (first op)
+                    :put-docs
+                    (let [[_ table & docs] op]
+                      (mapv #(delta/add-delta (assoc % :xt/table table)) docs))
 
-              :delete-docs
-              (let [[_ table & ids] op]
-                ;; For deletions, we'd need to fetch the doc before deleting
-                ;; For now, we'll create removal deltas with just the ID
-                (for [id ids]
-                  (delta/remove-delta {:xt/id id :xt/table table})))
+                    :delete-docs
+                    (let [[_ table & ids] op]
+                      ;; For deletions, we'd need to fetch the doc before deleting
+                      ;; For now, we'll create removal deltas with just the ID
+                      (mapv #(delta/remove-delta {:xt/id % :xt/table table}) ids))
 
-              []))
-          tx-ops))
+                    [])))
+        tx-ops))
 
 (defn find-affected-queries
   "Find queries affected by transaction.

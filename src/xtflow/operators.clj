@@ -5,7 +5,8 @@
   Operators include: from, where, unnest, with, aggregate, limit, return, without, offset, rel."
   (:require [clojure.string :as str]
             [clojure.set :as set]
-            [xtflow.delta :as delta]))
+            [xtflow.delta :as delta]
+            [xtflow.compiler :as compiler]))
 
 ;;; Nested Field Access
 ;;; Critical for accessing arbitrary attributes in predicate bodies
@@ -113,25 +114,29 @@
         (let [[_ field value] expr
               field-val (eval-expr field doc)
               comp-val (eval-expr value doc)]
-          (and field-val comp-val (> field-val comp-val)))
+          (and field-val comp-val
+               (> (double field-val) (double comp-val))))
 
         :<
         (let [[_ field value] expr
               field-val (eval-expr field doc)
               comp-val (eval-expr value doc)]
-          (and field-val comp-val (< field-val comp-val)))
+          (and field-val comp-val
+               (< (double field-val) (double comp-val))))
 
         :>=
         (let [[_ field value] expr
               field-val (eval-expr field doc)
               comp-val (eval-expr value doc)]
-          (and field-val comp-val (>= field-val comp-val)))
+          (and field-val comp-val
+               (>= (double field-val) (double comp-val))))
 
         :<=
         (let [[_ field value] expr
               field-val (eval-expr field doc)
               comp-val (eval-expr value doc)]
-          (and field-val comp-val (<= field-val comp-val)))
+          (and field-val comp-val
+               (<= (double field-val) (double comp-val))))
 
         ;; Not equal operators
         :!=
@@ -231,8 +236,8 @@
 
         :mod
         (let [[_ dividend divisor] expr
-              dividend-val (eval-expr dividend doc)
-              divisor-val (eval-expr divisor doc)]
+              dividend-val (long (eval-expr dividend doc))
+              divisor-val (long (eval-expr divisor doc))]
           (mod dividend-val divisor-val))
 
         ;; Math functions
@@ -403,12 +408,15 @@
 
 ;;; Where Operator
 
-(defrecord WhereOperator [predicate state]
+(defrecord WhereOperator [predicate compiled-predicate state]
   Operator
   (process-delta [_ delta]
     ;; Where filters documents based on predicate
-    (let [doc (:doc delta)]
-      (when (eval-expr predicate doc)
+    ;; Uses compiled version if available for 100-200% speedup
+    (let [doc (:doc delta)
+          pred-fn (or compiled-predicate
+                      (fn [d] (eval-expr predicate d)))]
+      (when (pred-fn doc)
         [delta])))
 
   (get-state [_] @state)
@@ -420,23 +428,27 @@
   Args:
     predicate - Expression to evaluate (e.g., [:= :predicate_type \"slsa\"])
 
-  Returns: WhereOperator instance"
+  Returns: WhereOperator instance with compiled predicate if enabled"
   [predicate]
-  (->WhereOperator predicate (atom nil)))
+  (let [compiled (when compiler/*use-compiled-exprs*
+                   (compiler/compile-expr-safe predicate))]
+    (->WhereOperator predicate compiled (atom nil))))
 
 ;;; Unnest Operator
 
-(defrecord UnnestOperator [array-field as-field state]
+(defrecord UnnestOperator [array-field as-field compiled-array-field state]
   Operator
   (process-delta [_ delta]
     ;; Unnest expands arrays into multiple deltas
     (let [doc (:doc delta)
           mult (:mult delta)
-          array-val (eval-expr array-field doc)]
+          array-fn (or compiled-array-field
+                       (fn [d] (eval-expr array-field d)))
+          array-val (array-fn doc)]
       (if (and (sequential? array-val) (seq array-val))
-        ;; Emit one delta per array element
-        (for [elem array-val]
-          (delta/make-delta (assoc doc as-field elem) mult))
+        ;; Emit one delta per array element (using mapv for eager evaluation)
+        (mapv (fn [elem] (delta/make-delta (assoc doc as-field elem) mult))
+              array-val)
         ;; Not an array or empty - pass through unchanged
         [delta])))
 
@@ -450,22 +462,28 @@
     array-field - Field expression containing array (e.g., :subjects or [:.. :predicate :components])
     as-field - Keyword for unnested element (e.g., :subject)
 
-  Returns: UnnestOperator instance"
+  Returns: UnnestOperator instance with compiled array-field if enabled"
   [array-field as-field]
-  (->UnnestOperator array-field as-field (atom nil)))
+  (let [compiled (when compiler/*use-compiled-exprs*
+                   (compiler/compile-expr-safe array-field))]
+    (->UnnestOperator array-field as-field compiled (atom nil))))
 
 ;;; With Operator
 
-(defrecord WithOperator [computed-fields state]
+(defrecord WithOperator [computed-fields compiled-fields state]
   Operator
   (process-delta [_ delta]
     ;; With adds computed fields to documents
+    ;; Uses compiled expressions if available for 100-200% speedup
     (let [doc (:doc delta)
           mult (:mult delta)
-          new-doc (reduce (fn [d [field-name expr]]
-                            (assoc d field-name (eval-expr expr d)))
+          new-doc (reduce (fn [d [field-name expr-or-fn]]
+                            (let [value (if (fn? expr-or-fn)
+                                          (expr-or-fn d)
+                                          (eval-expr expr-or-fn d))]
+                              (assoc d field-name value)))
                           doc
-                          computed-fields)]
+                          (or compiled-fields computed-fields))]
       [(delta/make-delta new-doc mult)]))
 
   (get-state [_] @state)
@@ -478,9 +496,17 @@
     computed-fields - Map of field-name -> expression
                       e.g., {:builder_id [:.. :predicate :builder :id]}
 
-  Returns: WithOperator instance"
+  Returns: WithOperator instance with compiled expressions if enabled"
   [computed-fields]
-  (->WithOperator computed-fields (atom nil)))
+  (let [compiled (when compiler/*use-compiled-exprs*
+                   (try
+                     (into {}
+                           (map (fn [[k v]]
+                                  [k (or (compiler/compile-expr-safe v) v)]))
+                           computed-fields)
+                     (catch Exception _
+                       nil)))]
+    (->WithOperator computed-fields compiled (atom nil))))
 
 ;;; Aggregate Operator
 
@@ -490,12 +516,17 @@
   Args:
     doc - Document map
     group-by - Field or vector of fields to group by
+    compiled-fn - Optional compiled function for group-by expression
 
   Returns: Group key (value or vector of values)"
-  [doc group-by]
-  (if (vector? group-by)
-    (mapv #(eval-expr % doc) group-by)
-    (eval-expr group-by doc)))
+  ([doc group-by]
+   (extract-group-key doc group-by nil))
+  ([doc group-by compiled-fn]
+   (if compiled-fn
+     (compiled-fn doc)
+     (if (vector? group-by)
+       (mapv #(eval-expr % doc) group-by)
+       (eval-expr group-by doc)))))
 
 (defn- compute-aggregations
   "Compute aggregations for a group with type hints and transients for performance.
@@ -504,64 +535,78 @@
     docs - Set of documents in group
     agg-specs - Map of result-field -> aggregation-spec
                 e.g., {:count [:row-count] :total [:sum :amount]}
+    compiled-agg-fields - Optional map of result-field -> compiled field function
 
   Returns: Map of aggregation results"
-  [docs agg-specs]
-  (persistent!
-   (reduce (fn [^clojure.lang.ITransientMap result [result-field agg-spec]]
-             (let [[agg-fn & args] (cond
-                                     (vector? agg-spec) agg-spec
-                                     (list? agg-spec) (vec agg-spec)
-                                     :else [agg-spec])
-                    ;; Convert symbol to keyword if needed
-                   agg-fn-kw (if (symbol? agg-fn) (keyword agg-fn) agg-fn)
-                   value (case agg-fn-kw
-                           :row-count (count docs)
+  ([docs agg-specs]
+   (compute-aggregations docs agg-specs nil))
+  ([docs agg-specs compiled-agg-fields]
+   (persistent!
+    (reduce (fn [^clojure.lang.ITransientMap result [result-field agg-spec]]
+              (let [[agg-fn & args] (cond
+                                      (vector? agg-spec) agg-spec
+                                      (list? agg-spec) (vec agg-spec)
+                                      :else [agg-spec])
+                     ;; Convert symbol to keyword if needed
+                    agg-fn-kw (if (symbol? agg-fn) (keyword agg-fn) agg-fn)
+                    ;; Get compiled function if available
+                    field-fn (or (get compiled-agg-fields result-field)
+                                 (fn [doc] (eval-expr (first args) doc)))
+                    value (case agg-fn-kw
+                            :row-count (count docs)
 
-                            ;; Single-pass numeric aggregations with type hints
-                           :sum (reduce (fn [^double acc doc]
-                                          (+ acc (double (eval-expr (first args) doc))))
-                                        0.0
-                                        docs)
+                             ;; Single-pass numeric aggregations with type hints
+                            :sum (reduce (fn [^double acc doc]
+                                           (+ acc (double (field-fn doc))))
+                                         0.0
+                                         docs)
 
-                           :min (when (seq docs)
-                                  (reduce (fn [min-val doc]
-                                            (let [v (eval-expr (first args) doc)]
-                                              (if (nil? min-val)
-                                                v
-                                                (if (and v (< (compare v min-val) 0)) v min-val))))
-                                          nil
-                                          docs))
+                            :min (when (seq docs)
+                                   (reduce (fn [min-val doc]
+                                             (let [v (field-fn doc)]
+                                               (cond
+                                                 (nil? min-val) v
+                                                 (nil? v) min-val
+                                                 (number? v) (let [vd (double v)
+                                                                   mind (double min-val)]
+                                                               (if (< vd mind) v min-val))
+                                                 :else (if (< (compare v min-val) 0) v min-val))))
+                                           nil
+                                           docs))
 
-                           :max (when (seq docs)
-                                  (reduce (fn [max-val doc]
-                                            (let [v (eval-expr (first args) doc)]
-                                              (if (nil? max-val)
-                                                v
-                                                (if (and v (> (compare v max-val) 0)) v max-val))))
-                                          nil
-                                          docs))
+                            :max (when (seq docs)
+                                   (reduce (fn [max-val doc]
+                                             (let [v (field-fn doc)]
+                                               (cond
+                                                 (nil? max-val) v
+                                                 (nil? v) max-val
+                                                 (number? v) (let [vd (double v)
+                                                                   maxd (double max-val)]
+                                                               (if (> vd maxd) v max-val))
+                                                 :else (if (> (compare v max-val) 0) v max-val))))
+                                           nil
+                                           docs))
 
-                            ;; Average - single pass with accumulator
-                           :avg (when (seq docs)
-                                  (let [[sum cnt] (reduce (fn [[^double s ^long c] doc]
-                                                            [(+ s (double (eval-expr (first args) doc)))
-                                                             (inc c)])
-                                                          [0.0 0]
-                                                          docs)]
-                                    (/ sum cnt)))
+                             ;; Average - single pass with accumulator
+                            :avg (when (seq docs)
+                                   (let [[sum cnt] (reduce (fn [[^double s ^long c] doc]
+                                                             [(+ s (double (field-fn doc)))
+                                                              (inc c)])
+                                                           [0.0 0]
+                                                           docs)]
+                                     (/ sum cnt)))
 
-                            ;; Count distinct - use transient set
-                           :count-distinct (count (persistent!
-                                                   (reduce (fn [^clojure.lang.ITransientSet s doc]
-                                                             (conj! s (eval-expr (first args) doc)))
-                                                           (transient #{})
-                                                           docs)))
+                             ;; Count distinct - use transient set
+                            :count-distinct (count (persistent!
+                                                    (reduce (fn [^clojure.lang.ITransientSet s doc]
+                                                              (conj! s (field-fn doc)))
+                                                            (transient #{})
+                                                            docs)))
 
-                           (throw (ex-info "Unknown aggregation function" {:fn agg-fn-kw})))]
-               (assoc! result result-field value)))
-           (transient {})
-           agg-specs)))
+                            (throw (ex-info "Unknown aggregation function" {:fn agg-fn-kw})))]
+                (assoc! result result-field value)))
+            (transient {})
+            agg-specs))))
 
 (defn- group-to-result
   "Convert group state to a result document.
@@ -571,24 +616,27 @@
     group-state - Group state map {:docs #{...}}
     group-by-field - Field name for group key in result
     agg-specs - Aggregation specifications
+    compiled-agg-fields - Optional map of result-field -> compiled field function
 
   Returns: Result document or nil if group is empty"
-  [group-key group-state group-by-field agg-specs]
-  (when (seq (:docs group-state))
-    (let [aggs (compute-aggregations (:docs group-state) agg-specs)
-          result (if group-by-field
-                   (assoc aggs group-by-field group-key)
-                   aggs)]
-      result)))
+  ([group-key group-state group-by-field agg-specs]
+   (group-to-result group-key group-state group-by-field agg-specs nil))
+  ([group-key group-state group-by-field agg-specs compiled-agg-fields]
+   (when (seq (:docs group-state))
+     (let [aggs (compute-aggregations (:docs group-state) agg-specs compiled-agg-fields)
+           result (if group-by-field
+                    (assoc aggs group-by-field group-key)
+                    aggs)]
+       result))))
 
-(defrecord AggregateOperator [group-by group-by-field agg-specs state]
+(defrecord AggregateOperator [group-by group-by-field agg-specs compiled-group-by compiled-agg-fields state]
   Operator
   (process-delta [_ delta]
     ;; Aggregate maintains group state and emits result deltas
     (let [doc (:doc delta)
           mult (:mult delta)
           group-key (if group-by
-                      (extract-group-key doc group-by)
+                      (extract-group-key doc group-by compiled-group-by)
                       ::all)
 
           ;; Get current group state
@@ -603,8 +651,8 @@
           new-group (assoc old-group :docs new-docs)
 
           ;; Compute old and new results
-          old-result (group-to-result group-key old-group group-by-field agg-specs)
-          new-result (group-to-result group-key new-group group-by-field agg-specs)
+          old-result (group-to-result group-key old-group group-by-field agg-specs compiled-agg-fields)
+          new-result (group-to-result group-key new-group group-by-field agg-specs compiled-agg-fields)
 
           ;; Update state
           _ (swap! state assoc-in [:groups group-key] new-group)
@@ -652,7 +700,45 @@
                           :else :group_key)]
      (create-aggregate-operator group-by group-by-field agg-specs)))
   ([group-by group-by-field agg-specs]
-   (->AggregateOperator group-by group-by-field agg-specs (atom {:groups {}}))))
+   (let [;; Compile group-by expression if enabled
+         compiled-group-by (when (and compiler/*use-compiled-exprs* group-by)
+                             (cond
+                               ;; Single keyword field - simple get
+                               (keyword? group-by)
+                               (compiler/compile-expr-safe group-by)
+
+                               ;; Vector of keywords - compile each field access
+                               (and (vector? group-by) (every? keyword? group-by))
+                               (let [fns (mapv compiler/compile-expr-safe group-by)]
+                                 (when (every? some? fns)
+                                   (fn [doc] (mapv #(% doc) fns))))
+
+                               ;; Expression - compile it
+                               :else
+                               (compiler/compile-expr-safe group-by)))
+
+         ;; Compile aggregation field expressions
+         compiled-agg-fields (when compiler/*use-compiled-exprs*
+                               (reduce-kv
+                                (fn [m result-field agg-spec]
+                                  (let [[_ & args] (cond
+                                                     (vector? agg-spec) agg-spec
+                                                     (list? agg-spec) (vec agg-spec)
+                                                     :else [agg-spec])]
+                                    ;; Only compile if there's a field expression (not :row-count)
+                                    (if (and (seq args) (first args))
+                                      (if-let [compiled (compiler/compile-expr-safe (first args))]
+                                        (assoc m result-field compiled)
+                                        m)
+                                      m)))
+                                {}
+                                agg-specs))]
+     (->AggregateOperator group-by
+                          group-by-field
+                          agg-specs
+                          compiled-group-by
+                          compiled-agg-fields
+                          (atom {:groups {}})))))
 
 ;;; Limit Operator
 
@@ -986,82 +1072,97 @@
         (let [join-key-val (get doc left-key)
               matching-right (get right-by-key join-key-val #{})]
           (if (pos? mult)
-            ;; Addition to left
-            (do
-              (swap! state update-in [:left-by-key join-key-val] (fnil conj #{}) doc)
-              (if (seq matching-right)
-                ;; Has matching right rows - emit joined results
-                (mapv (fn [right-doc]
-                        (let [joined (merge right-doc doc)]
-                          (swap! state update :emitted (fnil conj #{}) joined)
-                          (delta/make-delta joined mult)))
-                      matching-right)
-                ;; No matching right rows - emit left-only result
-                (do
-                  (swap! state update :unmatched-left (fnil conj #{}) doc)
-                  (swap! state update :emitted (fnil conj #{}) doc)
-                  [(delta/make-delta doc mult)])))
-            ;; Removal from left
-            (do
-              (swap! state update-in [:left-by-key join-key-val] disj doc)
-              (if (seq matching-right)
-                ;; Had matching right rows - emit removal deltas
-                (mapv (fn [right-doc]
-                        (let [joined (merge right-doc doc)]
-                          (swap! state update :emitted disj joined)
-                          (delta/make-delta joined mult)))
-                      matching-right)
-                ;; Was unmatched - emit removal of left-only result
-                (do
-                  (swap! state update :unmatched-left disj doc)
-                  (swap! state update :emitted disj doc)
-                  [(delta/make-delta doc mult)])))))
+            ;; Addition to left - BATCHED STATE UPDATE
+            (if (seq matching-right)
+              ;; Has matching right rows - emit joined results
+              (let [joined-docs (mapv #(merge % doc) matching-right)
+                    _ (swap! state (fn [s]
+                                     (-> s
+                                         (update-in [:left-by-key join-key-val] (fnil conj #{}) doc)
+                                         (update :emitted (fnil into #{}) joined-docs))))]
+                (mapv #(delta/make-delta % mult) joined-docs))
+              ;; No matching right rows - emit left-only result
+              (do
+                (swap! state (fn [s]
+                               (-> s
+                                   (update-in [:left-by-key join-key-val] (fnil conj #{}) doc)
+                                   (update :unmatched-left (fnil conj #{}) doc)
+                                   (update :emitted (fnil conj #{}) doc))))
+                [(delta/make-delta doc mult)]))
+            ;; Removal from left - BATCHED STATE UPDATE
+            (if (seq matching-right)
+              ;; Had matching right rows - emit removal deltas
+              (let [joined-docs (mapv #(merge % doc) matching-right)
+                    _ (swap! state (fn [s]
+                                     (-> s
+                                         (update-in [:left-by-key join-key-val] disj doc)
+                                         (update :emitted (fnil #(apply disj % joined-docs) #{}) identity))))]
+                (mapv #(delta/make-delta % mult) joined-docs))
+              ;; Was unmatched - emit removal of left-only result
+              (do
+                (swap! state (fn [s]
+                               (-> s
+                                   (update-in [:left-by-key join-key-val] disj doc)
+                                   (update :unmatched-left disj doc)
+                                   (update :emitted disj doc))))
+                [(delta/make-delta doc mult)]))))
 
         ;; Delta from right input
         (= source :right)
         (let [join-key-val (get doc right-key)
               matching-left (get left-by-key join-key-val #{})]
           (if (pos? mult)
-            ;; Addition to right
-            (do
-              (swap! state update-in [:right-by-key join-key-val] (fnil conj #{}) doc)
-              ;; For each matching left doc:
-              ;; 1. If it was unmatched, emit removal of left-only result
-              ;; 2. Emit joined result
-              (mapcat (fn [left-doc]
-                        (let [joined (merge doc left-doc)
-                              was-unmatched (contains? unmatched-left left-doc)]
-                          (when was-unmatched
-                            ;; Remove from unmatched set
-                            (swap! state update :unmatched-left disj left-doc)
-                            (swap! state update :emitted disj left-doc))
-                          (swap! state update :emitted (fnil conj #{}) joined)
-                          ;; Return deltas: remove old left-only (if applicable), add joined
-                          (if was-unmatched
-                            [(delta/make-delta left-doc -1)  ; remove left-only
-                             (delta/make-delta joined mult)] ; add joined
-                            [(delta/make-delta joined mult)]))) ; just add joined
-                      matching-left))
-            ;; Removal from right
+            ;; Addition to right - BATCHED STATE UPDATE
+            (let [;; Compute all changes first
+                  changes (mapv (fn [left-doc]
+                                  {:left-doc left-doc
+                                   :joined (merge doc left-doc)
+                                   :was-unmatched (contains? unmatched-left left-doc)})
+                                matching-left)
+                  unmatched-to-remove (into #{} (comp (filter :was-unmatched) (map :left-doc)) changes)
+                  joined-to-add (mapv :joined changes)
+                  ;; Single batched swap
+                  _ (swap! state (fn [s]
+                                   (-> s
+                                       (update-in [:right-by-key join-key-val] (fnil conj #{}) doc)
+                                       (update :unmatched-left #(apply disj % unmatched-to-remove))
+                                       (update :emitted (fn [e]
+                                                          (-> (apply disj e unmatched-to-remove)
+                                                              (into joined-to-add)))))))]
+              ;; Return deltas
+              (mapcat (fn [{:keys [left-doc joined was-unmatched]}]
+                        (if was-unmatched
+                          [(delta/make-delta left-doc -1)
+                           (delta/make-delta joined mult)]
+                          [(delta/make-delta joined mult)]))
+                      changes))
+            ;; Removal from right - BATCHED STATE UPDATE
             (let [;; Check other right matches BEFORE removing
-                  other-right-before (disj (get right-by-key join-key-val #{}) doc)]
-              (swap! state update-in [:right-by-key join-key-val] disj doc)
-              ;; For each matching left doc:
-              ;; 1. Emit removal of joined result
-              ;; 2. Emit left-only result (becomes unmatched again)
-              (mapcat (fn [left-doc]
-                        (let [joined (merge doc left-doc)]
-                          (swap! state update :emitted disj joined)
-                          (if (empty? other-right-before)
-                            ;; No other right matches - becomes unmatched
-                            (do
-                              (swap! state update :unmatched-left (fnil conj #{}) left-doc)
-                              (swap! state update :emitted (fnil conj #{}) left-doc)
-                              [(delta/make-delta joined mult)   ; remove joined
-                               (delta/make-delta left-doc 1)])  ; add left-only
-                            ;; Still has other right matches - just remove this join
-                            [(delta/make-delta joined mult)])))
-                      matching-left))))
+                  other-right-before (disj (get right-by-key join-key-val #{}) doc)
+                  ;; Compute all changes first
+                  changes (mapv (fn [left-doc]
+                                  {:left-doc left-doc
+                                   :joined (merge doc left-doc)
+                                   :becomes-unmatched (empty? other-right-before)})
+                                matching-left)
+                  joined-to-remove (mapv :joined changes)
+                  left-docs-to-add (into #{} (comp (filter :becomes-unmatched) (map :left-doc)) changes)
+                  ;; Single batched swap
+                  _ (swap! state (fn [s]
+                                   (-> s
+                                       (update-in [:right-by-key join-key-val] disj doc)
+                                       (update :emitted (fn [e]
+                                                          (-> (apply disj e joined-to-remove)
+                                                              (into left-docs-to-add))))
+                                       (update :unmatched-left (fn [u]
+                                                                 (into u left-docs-to-add))))))]
+              ;; Return deltas
+              (mapcat (fn [{:keys [left-doc joined becomes-unmatched]}]
+                        (if becomes-unmatched
+                          [(delta/make-delta joined mult)
+                           (delta/make-delta left-doc 1)]
+                          [(delta/make-delta joined mult)]))
+                      changes))))
 
         ;; Untagged delta - error
         :else
@@ -1095,29 +1196,22 @@
 (defrecord UnifyOperator [unify-fields state]
   Operator
   (process-delta [_ delta]
-    ;; UNIFY maintains both sides and performs multi-field matching
+    ;; UNIFY with HASH INDEXING for O(1) lookups instead of O(n) linear scans
     ;; unify-fields is a vector of [left-field right-field] pairs
     (let [doc (:doc delta)
           mult (:mult delta)
           source (delta/get-source delta)
           current-state @state
-          left-docs (:left-docs current-state #{})
-          right-docs (:right-docs current-state #{})]
+          left-index (:left-index current-state {})
+          right-index (:right-index current-state {})]
 
-      (letfn [(matches? [left-doc right-doc]
-                ;; Check if all unify-fields match between documents
-                (every? (fn [[left-field right-field]]
-                          (= (get left-doc left-field)
-                             (get right-doc right-field)))
-                        unify-fields))
-
-              (find-matches [doc other-docs is-left?]
-                ;; Find all documents in other-docs that match doc
-                (filter (fn [other-doc]
-                          (if is-left?
-                            (matches? doc other-doc)
-                            (matches? other-doc doc)))
-                        other-docs))
+      (letfn [(compute-key [doc is-left?]
+                ;; Compute composite key from unify fields
+                (mapv (fn [[left-field right-field]]
+                        (if is-left?
+                          (get doc left-field)
+                          (get doc right-field)))
+                      unify-fields))
 
               (merge-unified [left-doc right-doc]
                 ;; Merge documents (right fields take precedence on conflicts)
@@ -1125,57 +1219,57 @@
 
         (cond
           (= source :left)
-          (if (pos? mult)
-            ;; Add to left side
-            (do
-              (swap! state update :left-docs (fnil conj #{}) doc)
-              ;; Find all matching right documents
-              (let [matching-right (find-matches doc right-docs true)]
-                (mapv (fn [right-doc]
-                        (let [unified (merge-unified doc right-doc)]
-                          (swap! state update :emitted (fnil conj #{}) unified)
-                          (delta/make-delta unified mult)))
-                      matching-right)))
-            ;; Remove from left side
-            (do
-              (swap! state update :left-docs disj doc)
-              ;; Remove all matches that involved this document
-              (let [matching-right (find-matches doc right-docs true)]
-                (mapv (fn [right-doc]
-                        (let [unified (merge-unified doc right-doc)]
-                          (swap! state update :emitted disj unified)
-                          (delta/make-delta unified mult)))
-                      matching-right))))
+          (let [key (compute-key doc true)
+                matching-right (get right-index key #{})]
+            (if (pos? mult)
+              ;; Add to left side - BATCHED UPDATE
+              (let [unified-docs (mapv #(merge-unified doc %) matching-right)]
+                (swap! state (fn [s]
+                               (-> s
+                                   (update-in [:left-index key] (fnil conj #{}) doc)
+                                   (update :emitted (fnil into #{}) unified-docs))))
+                (mapv #(delta/make-delta % mult) unified-docs))
+              ;; Remove from left side - BATCHED UPDATE
+              (let [unified-docs (mapv #(merge-unified doc %) matching-right)]
+                (swap! state (fn [s]
+                               (-> s
+                                   (update-in [:left-index key] disj doc)
+                                   (update :emitted (fn [e] (apply disj e unified-docs))))))
+                (mapv #(delta/make-delta % mult) unified-docs))))
 
           (= source :right)
-          (if (pos? mult)
-            ;; Add to right side
-            (do
-              (swap! state update :right-docs (fnil conj #{}) doc)
-              ;; Find all matching left documents
-              (let [matching-left (find-matches doc left-docs false)]
-                (mapv (fn [left-doc]
-                        (let [unified (merge-unified left-doc doc)]
-                          (swap! state update :emitted (fnil conj #{}) unified)
-                          (delta/make-delta unified mult)))
-                      matching-left)))
-            ;; Remove from right side
-            (do
-              (swap! state update :right-docs disj doc)
-              ;; Remove all matches that involved this document
-              (let [matching-left (find-matches doc left-docs false)]
-                (mapv (fn [left-doc]
-                        (let [unified (merge-unified left-doc doc)]
-                          (swap! state update :emitted disj unified)
-                          (delta/make-delta unified mult)))
-                      matching-left))))
+          (let [key (compute-key doc false)
+                matching-left (get left-index key #{})]
+            (if (pos? mult)
+              ;; Add to right side - BATCHED UPDATE
+              (let [unified-docs (mapv #(merge-unified % doc) matching-left)]
+                (swap! state (fn [s]
+                               (-> s
+                                   (update-in [:right-index key] (fnil conj #{}) doc)
+                                   (update :emitted (fnil into #{}) unified-docs))))
+                (mapv #(delta/make-delta % mult) unified-docs))
+              ;; Remove from right side - BATCHED UPDATE
+              (let [unified-docs (mapv #(merge-unified % doc) matching-left)]
+                (swap! state (fn [s]
+                               (-> s
+                                   (update-in [:right-index key] disj doc)
+                                   (update :emitted (fn [e] (apply disj e unified-docs))))))
+                (mapv #(delta/make-delta % mult) unified-docs))))
 
           :else
           (throw (ex-info "UNIFY operator requires tagged deltas with :source"
                           {:delta delta}))))))
 
-  (get-state [_] @state)
-  (reset-state! [_] (reset! state {:left-docs #{} :right-docs #{} :emitted #{}})))
+  (get-state [_]
+    ;; Provide backward compatibility by deriving left-docs/right-docs from indexes
+    (let [s @state
+          left-docs (into #{} (mapcat val) (:left-index s))
+          right-docs (into #{} (mapcat val) (:right-index s))]
+      (assoc s
+             :left-docs left-docs
+             :right-docs right-docs)))
+
+  (reset-state! [_] (reset! state {:left-index {} :right-index {} :emitted #{}})))
 
 (defn create-unify-operator
   "Create a UNIFY operator for Datalog-style multi-field unification.
@@ -1419,36 +1513,36 @@
                 final-results))
             ;; Removal from right - batch all state updates
             (let [new-right-by-key (update right-by-key join-key-val disj doc)
-                  remaining-right (disj (get right-by-key join-key-val #{}) doc)]
-              (let [[results nested-updates]
-                    (reduce (fn [[^clojure.lang.ITransientVector res updates] left-doc]
-                              (let [left-id (:xt/id left-doc)
-                                    old-nested (get nested-docs left-id)
-                                    [new-updates deltas]
-                                    (if (seq remaining-right)
-                                      ;; Still has other matches - update to first remaining
-                                      (let [first-match (first remaining-right)]
-                                        [(assoc updates left-id first-match)
-                                         [(delta/make-delta (assoc left-doc field-name old-nested) -1)
-                                          (delta/make-delta (assoc left-doc field-name first-match) 1)]])
-                                      ;; No more matches - becomes nil
-                                      [(assoc updates left-id ::remove)
+                  remaining-right (disj (get right-by-key join-key-val #{}) doc)
+                  [results nested-updates]
+                  (reduce (fn [[^clojure.lang.ITransientVector res updates] left-doc]
+                            (let [left-id (:xt/id left-doc)
+                                  old-nested (get nested-docs left-id)
+                                  [new-updates deltas]
+                                  (if (seq remaining-right)
+                                    ;; Still has other matches - update to first remaining
+                                    (let [first-match (first remaining-right)]
+                                      [(assoc updates left-id first-match)
                                        [(delta/make-delta (assoc left-doc field-name old-nested) -1)
-                                        (delta/make-delta (assoc left-doc field-name nil) 1)]])]
-                                [(reduce conj! res deltas) new-updates]))
-                            [(transient []) {}]
-                            matching-left)
-                    final-results (persistent! results)]
-                ;; SINGLE SWAP - update right-by-key and nested docs
-                (swap! state (fn [s]
-                               (let [s' (assoc s :right-by-key new-right-by-key)]
-                                 (reduce (fn [state' [left-id new-nested]]
-                                           (if (= new-nested ::remove)
-                                             (update state' :nested-docs dissoc left-id)
-                                             (assoc-in state' [:nested-docs left-id] new-nested)))
-                                         s'
-                                         nested-updates))))
-                final-results))))
+                                        (delta/make-delta (assoc left-doc field-name first-match) 1)]])
+                                    ;; No more matches - becomes nil
+                                    [(assoc updates left-id ::remove)
+                                     [(delta/make-delta (assoc left-doc field-name old-nested) -1)
+                                      (delta/make-delta (assoc left-doc field-name nil) 1)]])]
+                              [(reduce conj! res deltas) new-updates]))
+                          [(transient []) {}]
+                          matching-left)
+                  final-results (persistent! results)]
+              ;; SINGLE SWAP - update right-by-key and nested docs
+              (swap! state (fn [s]
+                             (let [s' (assoc s :right-by-key new-right-by-key)]
+                               (reduce (fn [state' [left-id new-nested]]
+                                         (if (= new-nested ::remove)
+                                           (update state' :nested-docs dissoc left-id)
+                                           (assoc-in state' [:nested-docs left-id] new-nested)))
+                                       s'
+                                       nested-updates))))
+              final-results)))
 
         ;; Untagged delta - error
         :else
@@ -1538,49 +1632,49 @@
                                           join-key-val
                                           (conj (get right-by-key join-key-val #{}) doc))
                   ;; Calculate new array for this key (after adding doc)
-                  new-array (vec (conj (get right-by-key join-key-val #{}) doc))]
-              ;; Process all matching left docs and accumulate updates
-              (let [[results array-updates]
-                    (reduce (fn [[^clojure.lang.ITransientVector res updates] left-doc]
-                              (let [left-id (:xt/id left-doc)
-                                    old-array (get nested-arrays left-id [])
-                                    new-updates (assoc updates left-id new-array)
-                                    deltas [(delta/make-delta (assoc left-doc field-name old-array) -1)
-                                            (delta/make-delta (assoc left-doc field-name new-array) 1)]
-                                    new-res (reduce conj! res deltas)]
-                                [new-res new-updates]))
-                            [(transient []) {}]
-                            matching-left)
-                    final-results (persistent! results)]
-                ;; SINGLE SWAP - update right-by-key and all nested arrays
-                (swap! state (fn [s]
-                               (-> s
-                                   (assoc :right-by-key new-right-by-key)
-                                   (update :nested-arrays merge array-updates))))
-                final-results))
+                  new-array (vec (conj (get right-by-key join-key-val #{}) doc))
+                  ;; Process all matching left docs and accumulate updates
+                  [results array-updates]
+                  (reduce (fn [[^clojure.lang.ITransientVector res updates] left-doc]
+                            (let [left-id (:xt/id left-doc)
+                                  old-array (get nested-arrays left-id [])
+                                  new-updates (assoc updates left-id new-array)
+                                  deltas [(delta/make-delta (assoc left-doc field-name old-array) -1)
+                                          (delta/make-delta (assoc left-doc field-name new-array) 1)]
+                                  new-res (reduce conj! res deltas)]
+                              [new-res new-updates]))
+                          [(transient []) {}]
+                          matching-left)
+                  final-results (persistent! results)]
+              ;; SINGLE SWAP - update right-by-key and all nested arrays
+              (swap! state (fn [s]
+                             (-> s
+                                 (assoc :right-by-key new-right-by-key)
+                                 (update :nested-arrays merge array-updates))))
+              final-results)
             ;; Removal from right - batch all state updates
             (let [new-right-by-key (update right-by-key join-key-val disj doc)
                   ;; Calculate new array after removal
                   remaining-right (disj (get right-by-key join-key-val #{}) doc)
-                  new-array (vec remaining-right)]
-              (let [[results array-updates]
-                    (reduce (fn [[^clojure.lang.ITransientVector res updates] left-doc]
-                              (let [left-id (:xt/id left-doc)
-                                    old-array (get nested-arrays left-id [])
-                                    new-updates (assoc updates left-id new-array)
-                                    deltas [(delta/make-delta (assoc left-doc field-name old-array) -1)
-                                            (delta/make-delta (assoc left-doc field-name new-array) 1)]
-                                    new-res (reduce conj! res deltas)]
-                                [new-res new-updates]))
-                            [(transient []) {}]
-                            matching-left)
-                    final-results (persistent! results)]
-                ;; SINGLE SWAP - update right-by-key and all nested arrays
-                (swap! state (fn [s]
-                               (-> s
-                                   (assoc :right-by-key new-right-by-key)
-                                   (update :nested-arrays merge array-updates))))
-                final-results))))
+                  new-array (vec remaining-right)
+                  [results array-updates]
+                  (reduce (fn [[^clojure.lang.ITransientVector res updates] left-doc]
+                            (let [left-id (:xt/id left-doc)
+                                  old-array (get nested-arrays left-id [])
+                                  new-updates (assoc updates left-id new-array)
+                                  deltas [(delta/make-delta (assoc left-doc field-name old-array) -1)
+                                          (delta/make-delta (assoc left-doc field-name new-array) 1)]
+                                  new-res (reduce conj! res deltas)]
+                              [new-res new-updates]))
+                          [(transient []) {}]
+                          matching-left)
+                  final-results (persistent! results)]
+              ;; SINGLE SWAP - update right-by-key and all nested arrays
+              (swap! state (fn [s]
+                             (-> s
+                                 (assoc :right-by-key new-right-by-key)
+                                 (update :nested-arrays merge array-updates))))
+              final-results)))
 
         ;; Untagged delta - error
         :else

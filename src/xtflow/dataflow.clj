@@ -152,42 +152,40 @@
 
   Returns: Map of leaf-operator-id -> final output deltas"
   [graph input-deltas]
-  (loop [;; Queue of (operator-id, deltas) pairs to process
-         ;; For each root, get appropriate initial deltas (REL generates its own)
-         queue (for [root-id (:root-operators graph)
-                     :let [operator (get-in graph [:operators root-id])
-                           deltas (get-initial-deltas-for-operator operator input-deltas)]]
-                 [root-id deltas])
-         ;; Track outputs from leaf operators
-         ;; For multi-input, we need to accumulate outputs across multiple processings
-         leaf-outputs {}]
-    (if (empty? queue)
-      ;; Done - return leaf outputs
-      leaf-outputs
+  ;; Use mutable ArrayDeque for better performance (no lazy seq overhead)
+  (let [queue (java.util.ArrayDeque.)]
+    ;; Initialize queue with root operators
+    (doseq [root-id (:root-operators graph)]
+      (let [operator (get-in graph [:operators root-id])
+            deltas (get-initial-deltas-for-operator operator input-deltas)]
+        (when (seq deltas)
+          (.offer queue [root-id deltas]))))
 
-      ;; Process next operator
-      (let [[operator-id deltas] (first queue)
-            remaining (rest queue)
-            ;; Process operator with deltas (no visited check - multi-input needs multiple passes)
-            operator (get-in graph [:operators operator-id])
-            ;; Process each delta through operator with transient for performance
-            output-deltas (persistent!
-                           (reduce (fn [^clojure.lang.ITransientVector acc delta]
-                                     (reduce conj! acc (propagate-through-operator operator delta)))
-                                   (transient [])
-                                   deltas))
-            ;; Propagate to downstream
-            downstream-map (propagate-to-downstream graph operator-id output-deltas)
-            ;; Add downstream work to queue
-            new-queue (concat remaining
-                              (for [[down-id down-deltas] downstream-map]
-                                [down-id down-deltas]))
-            ;; Update leaf outputs if this is a leaf
-            ;; Accumulate outputs across multiple processing
-            new-leaf-outputs (if (contains? (:leaf-operators graph) operator-id)
-                               (update leaf-outputs operator-id (fnil into []) output-deltas)
-                               leaf-outputs)]
-        (recur new-queue new-leaf-outputs)))))
+    ;; Process queue with mutable leaf-outputs for efficiency
+    (loop [leaf-outputs (transient {})]
+      (if (.isEmpty queue)
+        ;; Done - return persistent leaf outputs
+        (persistent! leaf-outputs)
+
+        ;; Process next operator
+        (let [[operator-id deltas] (.poll queue)
+              operator (get-in graph [:operators operator-id])
+              ;; Process each delta through operator with transient for performance
+              output-deltas (into []
+                                  (mapcat #(propagate-through-operator operator %))
+                                  deltas)
+              ;; Propagate to downstream
+              downstream-map (propagate-to-downstream graph operator-id output-deltas)]
+
+          ;; Add downstream work to queue
+          (doseq [[down-id down-deltas] downstream-map]
+            (.offer queue [down-id down-deltas]))
+
+          ;; Update leaf outputs if this is a leaf
+          (if (contains? (:leaf-operators graph) operator-id)
+            (recur (assoc! leaf-outputs operator-id
+                           (into (get leaf-outputs operator-id []) output-deltas)))
+            (recur leaf-outputs)))))))
 
 ;;; Simple Linear Pipeline Helper
 
