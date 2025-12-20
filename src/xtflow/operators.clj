@@ -132,6 +132,19 @@
               comp-val (eval-expr value doc)]
           (and field-val comp-val (<= field-val comp-val)))
 
+        ;; Not equal operators
+        :!=
+        (let [[_ field value] expr
+              field-val (eval-expr field doc)
+              comp-val (eval-expr value doc)]
+          (not= field-val comp-val))
+
+        :<>
+        (let [[_ field value] expr
+              field-val (eval-expr field doc)
+              comp-val (eval-expr value doc)]
+          (not= field-val comp-val))
+
         ;; Pattern matching
         :like
         (let [[_ field pattern] expr
@@ -142,6 +155,182 @@
                             (str/replace "%" ".*")
                             (str/replace "_" "."))]
           (boolean (re-matches (re-pattern regex-str) field-val)))
+
+        :like-regex
+        (let [[_ field pattern] expr
+              field-val (str (eval-expr field doc))
+              pattern-str (str (eval-expr pattern doc))]
+          (boolean (re-find (re-pattern pattern-str) field-val)))
+
+        ;; String functions
+        :trim
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (when field-val
+            (str/trim (str field-val))))
+
+        :trim-leading
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (when field-val
+            (str/triml (str field-val))))
+
+        :trim-trailing
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (when field-val
+            (str/trimr (str field-val))))
+
+        :overlay
+        (let [[_ target replacement start-pos length] expr
+              target-val (str (eval-expr target doc))
+              replacement-val (str (eval-expr replacement doc))
+              start (eval-expr start-pos doc)
+              len (if length (eval-expr length doc) (count replacement-val))]
+          (str (subs target-val 0 (dec start))
+               replacement-val
+               (subs target-val (+ (dec start) len))))
+
+        ;; Null/boolean predicates
+        :nil?
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (nil? field-val))
+
+        :true?
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (true? field-val))
+
+        :false?
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (false? field-val))
+
+        ;; Arithmetic operators
+        :+
+        (let [args (rest expr)
+              values (map #(eval-expr % doc) args)]
+          (apply + values))
+
+        :-
+        (let [args (rest expr)
+              values (map #(eval-expr % doc) args)]
+          (apply - values))
+
+        :*
+        (let [args (rest expr)
+              values (map #(eval-expr % doc) args)]
+          (apply * values))
+
+        :/
+        (let [args (rest expr)
+              values (map #(eval-expr % doc) args)]
+          (apply / values))
+
+        :mod
+        (let [[_ dividend divisor] expr
+              dividend-val (eval-expr dividend doc)
+              divisor-val (eval-expr divisor doc)]
+          (mod dividend-val divisor-val))
+
+        ;; Math functions
+        :abs
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (when field-val
+            (Math/abs (double field-val))))
+
+        :floor
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (when field-val
+            (Math/floor (double field-val))))
+
+        :ceil
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (when field-val
+            (Math/ceil (double field-val))))
+
+        :round
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (when field-val
+            (Math/round (double field-val))))
+
+        :sqrt
+        (let [[_ field] expr
+              field-val (eval-expr field doc)]
+          (when field-val
+            (Math/sqrt (double field-val))))
+
+        :pow
+        (let [[_ base exponent] expr
+              base-val (eval-expr base doc)
+              exp-val (eval-expr exponent doc)]
+          (when (and base-val exp-val)
+            (Math/pow (double base-val) (double exp-val))))
+
+        ;; Control structures
+        :if
+        (let [[_ condition then-expr else-expr] expr
+              cond-val (eval-expr condition doc)]
+          (if cond-val
+            (eval-expr then-expr doc)
+            (eval-expr else-expr doc)))
+
+        :case
+        (let [args (rest expr)
+              pairs (partition 2 2 nil (butlast args))
+              default (last args)]
+          (loop [pairs pairs]
+            (if (empty? pairs)
+              (eval-expr default doc)
+              (let [[condition result] (first pairs)]
+                (if (eval-expr condition doc)
+                  (eval-expr result doc)
+                  (recur (rest pairs)))))))
+
+        :cond
+        (let [args (rest expr)
+              pairs (partition 2 2 nil args)]
+          (loop [pairs pairs]
+            (if (empty? pairs)
+              nil
+              (let [[condition result] (first pairs)]
+                (if (or (nil? condition) (eval-expr condition doc))
+                  (eval-expr result doc)
+                  (recur (rest pairs)))))))
+
+        :let
+        (let [[_ bindings body] expr
+              binding-pairs (partition 2 bindings)
+              ;; Create new doc context with bindings
+              new-doc (reduce (fn [d [name value]]
+                                (assoc d (if (symbol? name) (keyword name) name)
+                                       (eval-expr value d)))
+                              doc
+                              binding-pairs)]
+          (eval-expr body new-doc))
+
+        :coalesce
+        (let [args (rest expr)]
+          (loop [args args]
+            (if (empty? args)
+              nil
+              (let [val (eval-expr (first args) doc)]
+                (if (nil? val)
+                  (recur (rest args))
+                  val)))))
+
+        :null-if
+        (let [[_ field1 field2] expr
+              val1 (eval-expr field1 doc)
+              val2 (eval-expr field2 doc)]
+          (if (= val1 val2)
+            nil
+            val1))
 
         ;; Boolean logic
         :and
