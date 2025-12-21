@@ -3,7 +3,7 @@
 
   These tests run comprehensive property-based testing to find edge cases
   and rare bugs. For quick CI feedback, see fuzzing_quick_test.clj."
-  (:require [clojure.test :refer [deftest testing is use-fixtures]]
+  (:require [clojure.test :refer [use-fixtures]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.properties :as prop]
             [clojure.test.check.generators :as gen]

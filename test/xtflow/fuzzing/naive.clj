@@ -8,7 +8,6 @@
   Key principle: Correctness over performance.
   All operations use simple, obviously-correct implementations."
   (:require [xtdb.api :as xt]
-            [clojure.set :as set]
             [clojure.string :as str]))
 
 ;;; ============================================================================
@@ -324,13 +323,13 @@
 
 (defn naive-exists
   "EXISTS operator: filter by subquery existence."
-  [data subquery-fn]
+  [data _subquery-fn]
   ;; Placeholder - will be implemented when needed
   data)
 
 (defn naive-pull
   "PULL operator: fetch related documents."
-  [data patterns xtdb-client]
+  [data _patterns _xtdb-client]
   ;; Placeholder - will be implemented when needed
   data)
 
@@ -372,6 +371,7 @@
                          data)]
           (recur new-data (rest ops)))))))
 
+#_{:clj-kondo/ignore [:unresolved-symbol]}
 (comment
   ;; Example usage
 

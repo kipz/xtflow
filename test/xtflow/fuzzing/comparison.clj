@@ -3,8 +3,7 @@
 
   Handles normalization and comparison of query results from naive
   and dataflow implementations, accounting for non-determinism."
-  (:require [clojure.set :as set]
-            [clojure.data :as data]))
+  (:require [clojure.data :as data]))
 
 ;;; ============================================================================
 ;;; Normalization

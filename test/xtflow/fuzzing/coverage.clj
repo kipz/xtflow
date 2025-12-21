@@ -8,16 +8,16 @@
 ;;; Coverage State
 ;;; ============================================================================
 
-(defonce operator-coverage
-  "Tracks how many times each operator has been tested."
+(defonce ^{:doc "Tracks how many times each operator has been tested."}
+  operator-coverage
   (atom {}))
 
-(defonce operator-pair-coverage
-  "Tracks how many times each operator pair has been tested."
+(defonce ^{:doc "Tracks how many times each operator pair has been tested."}
+  operator-pair-coverage
   (atom {}))
 
-(defonce operator-triple-coverage
-  "Tracks how many times each operator triple has been tested."
+(defonce ^{:doc "Tracks how many times each operator triple has been tested."}
+  operator-triple-coverage
   (atom {}))
 
 ;;; ============================================================================

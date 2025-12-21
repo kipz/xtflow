@@ -3,7 +3,8 @@
 
   Verifies mathematical properties and state consistency beyond simple
   result equality. These checks help catch subtle bugs in operator
-  implementations.")
+  implementations."
+  (:require [clojure.set :as set]))
 
 ;;; ============================================================================
 ;;; General Invariants
@@ -89,8 +90,8 @@
 
 (defn check-no-duplicate-fields
   "Verify no fields are duplicated (except join keys)."
-  [result-data left-fields right-fields join-key]
-  (let [common-fields (clojure.set/intersection
+  [_result-data left-fields right-fields join-key]
+  (let [common-fields (set/intersection
                        (disj (set left-fields) join-key)
                        (disj (set right-fields) join-key))]
     (empty? common-fields)))
@@ -104,17 +105,16 @@
 
   For each input document with array of N elements,
   should produce N output documents."
-  [input-data output-data array-field]
+  [input-data output-data _array-field]
   ;; This is a simplified check - real implementation would track document IDs
   (>= (count output-data) (count input-data)))
 
 (defn check-unnest-preserves-fields
   "Verify UNNEST preserves original fields (plus new binding)."
-  [input-data output-data original-fields binding-var]
-  (let [expected-fields (conj (set original-fields) binding-var)]
-    (every? (fn [result]
-              (clojure.set/subset? original-fields (set (keys result))))
-            output-data)))
+  [_input-data output-data original-fields _binding-var]
+  (every? (fn [result]
+            (set/subset? original-fields (set (keys result))))
+          output-data))
 
 ;;; ============================================================================
 ;;; LIMIT/OFFSET Invariants
