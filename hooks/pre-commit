@@ -12,7 +12,7 @@ if [ -z "$STAGED_FILES" ]; then
 fi
 
 # Run clj-kondo on staged files
-clj-kondo --lint $STAGED_FILES 2>&1 | tee /dev/tty
+clj-kondo --lint --fail-level info $STAGED_FILES 2>&1 | tee /dev/tty
 
 # Check exit code
 if [ $? -ne 0 ]; then
