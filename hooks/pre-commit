@@ -11,11 +11,24 @@ if [ -z "$STAGED_FILES" ]; then
     exit 0
 fi
 
-# Run clj-kondo on staged files
-clj-kondo --lint --fail-level info $STAGED_FILES 2>&1 | tee /dev/tty
+# Run clj-kondo and capture output
+OUTPUT=$(clj-kondo --lint $STAGED_FILES 2>&1)
+EXIT_CODE=$?
 
-# Check exit code
-if [ $? -ne 0 ]; then
+# Print the output
+echo "$OUTPUT"
+
+# Fail if clj-kondo found any issues (even info level)
+# clj-kondo outputs "linting took" when successful with no findings
+if echo "$OUTPUT" | grep -v "linting took" | grep -E "(warning|error|info):"; then
+    echo ""
+    echo "❌ clj-kondo found issues. Please fix them before committing."
+    echo "   To skip this check, use: git commit --no-verify"
+    exit 1
+fi
+
+# Also check the exit code for errors/warnings
+if [ $EXIT_CODE -ne 0 ]; then
     echo ""
     echo "❌ clj-kondo found issues. Please fix them before committing."
     echo "   To skip this check, use: git commit --no-verify"
