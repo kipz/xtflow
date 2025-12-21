@@ -1,5 +1,7 @@
 (ns xtflow.fuzzing.utils
-  "Shared utilities for fuzzing tests.")
+  "Shared utilities for fuzzing tests."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]))
 
 ;;; ============================================================================
 ;;; Failure Reporting
@@ -17,11 +19,11 @@
 (defn save-failure
   "Save test failure to file for later analysis."
   [failure]
-  (let [failures-dir (clojure.java.io/file "target/fuzzing-failures")
+  (let [failures-dir (io/file "target/fuzzing-failures")
         timestamp (:timestamp failure)
         filename (str "failure-" timestamp ".edn")]
     (.mkdirs failures-dir)
-    (spit (clojure.java.io/file failures-dir filename)
+    (spit (io/file failures-dir filename)
           (pr-str failure))
     (str "Saved failure to target/fuzzing-failures/" filename)))
 
@@ -39,14 +41,14 @@
   [query-spec]
   (str "Table: " (:table query-spec) "\n"
        "Operators:\n"
-       (clojure.string/join "\n"
-                            (map-indexed
-                             (fn [idx op]
-                               (format "  %d. %s %s"
-                                       (inc idx)
-                                       (name (:op op))
-                                       (dissoc op :op)))
-                             (:operators query-spec)))))
+       (str/join "\n"
+                 (map-indexed
+                  (fn [idx op]
+                    (format "  %d. %s %s"
+                            (inc idx)
+                            (name (:op op))
+                            (dissoc op :op)))
+                  (:operators query-spec)))))
 
 ;;; ============================================================================
 ;;; Data Inspection
@@ -98,6 +100,8 @@
 ;;; Debugging
 ;;; ============================================================================
 
+(def ^:dynamic *debug-enabled* false)
+
 (defn enable-debug-logging!
   "Enable debug logging for fuzzing tests."
   []
@@ -107,8 +111,6 @@
   "Disable debug logging for fuzzing tests."
   []
   (alter-var-root #'*debug-enabled* (constantly false)))
-
-(def ^:dynamic *debug-enabled* false)
 
 (defmacro debug
   "Print debug message if debugging is enabled."
