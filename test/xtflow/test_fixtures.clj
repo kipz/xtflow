@@ -36,11 +36,19 @@
     ;; Clear queries
     (diff/reset-all-queries!)
 
-    ;; Clear tables
+    ;; Clear tables and wait for completion
     (doseq [table tables]
       (try
-        (xt/execute-tx *xtdb-client*
-                       [[:sql (str "DELETE FROM " (name table))]])
+        (let [ids (map :xt/id (xt/q *xtdb-client* (list 'from table ['xt/id])))
+              tx-result (when (seq ids)
+                          (xt/execute-tx *xtdb-client*
+                                         [(into [:delete-docs table] ids)]))]
+          ;; Wait for delete to complete AND verify table is empty
+          (when tx-result
+            @tx-result
+            ;; Query again to ensure delete is processed
+            (while (seq (xt/q *xtdb-client* (list 'from table ['xt/id])))
+              (Thread/sleep 10))))
         (catch Exception _
           ;; Table might not exist, that's okay
           nil)))

@@ -8,18 +8,42 @@
 
  :aliases
  {:test {:extra-paths ["test" "examples"]
-         :extra-deps {io.github.cognitect-labs/test-runner
+         :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
+                      io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                       clj-test-containers/clj-test-containers
                       {:mvn/version "0.7.4"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test
-         :exec-args {:excludes [:benchmark]}
+         :exec-args {:excludes [:benchmark :fuzzing-quick :fuzzing-extended]}
          :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
                     "-Dio.netty.tryReflectionSetAccessible=true"]}
 
+  :fuzzing-quick {:extra-paths ["test"]
+                  :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
+                               io.github.cognitect-labs/test-runner
+                               {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                               clj-test-containers/clj-test-containers
+                               {:mvn/version "0.7.4"}}
+                  :exec-fn cognitect.test-runner.api/test
+                  :exec-args {:includes [:fuzzing-quick]}
+                  :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                             "-Dio.netty.tryReflectionSetAccessible=true"]}
+
+  :fuzzing-extended {:extra-paths ["test"]
+                     :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
+                                  io.github.cognitect-labs/test-runner
+                                  {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                                  clj-test-containers/clj-test-containers
+                                  {:mvn/version "0.7.4"}}
+                     :exec-fn cognitect.test-runner.api/test
+                     :exec-args {:includes [:fuzzing-extended]}
+                     :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                                "-Dio.netty.tryReflectionSetAccessible=true"]}
+
   :benchmark {:extra-paths ["test" "examples"]
-              :extra-deps {io.github.cognitect-labs/test-runner
+              :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
+                           io.github.cognitect-labs/test-runner
                            {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                            clj-test-containers/clj-test-containers
                            {:mvn/version "0.7.4"}}

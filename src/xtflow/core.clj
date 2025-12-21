@@ -134,6 +134,10 @@
 (defn tx-ops->deltas
   "Convert transaction operations to deltas.
 
+  CRITICAL: Deduplicates documents by :xt/id before generating deltas.
+  When the same document ID appears multiple times in :put-docs, only the
+  last version is kept (XTDB upsert semantics), generating a single ADD delta.
+
   Args:
     tx-ops - Transaction operations
 
@@ -143,12 +147,13 @@
         (mapcat (fn [op]
                   (case (first op)
                     :put-docs
-                    (let [[_ table & docs] op]
-                      (mapv #(delta/add-delta (assoc % :xt/table table)) docs))
+                    (let [[_ table & docs] op
+                          ;; Deduplicate by :xt/id (keep last version for upsert semantics)
+                          deduped-docs (vals (into {} (map (fn [doc] [(:xt/id doc) doc]) docs)))]
+                      (mapv #(delta/add-delta (assoc % :xt/table table)) deduped-docs))
 
                     :delete-docs
                     (let [[_ table & ids] op]
-                      ;; For deletions, we'd need to fetch the doc before deleting
                       ;; For now, we'll create removal deltas with just the ID
                       (mapv #(delta/remove-delta {:xt/id % :xt/table table}) ids))
 
@@ -226,11 +231,13 @@
   [xtdb-client tx-ops]
   ;; 1. Execute transaction in XTDB
   (let [tx-result (xt/execute-tx xtdb-client tx-ops)
+        ;; TODO: XTDB 2.x transactions return TxKey, not Future
+        ;; Need to investigate if transactions are synchronous or if we need to wait differently
 
         ;; 2. Find affected queries
         affected-queries (find-affected-queries tx-ops)
 
-        ;; 3. Extract deltas from transaction
+        ;; 3. Extract deltas from transaction operations
         deltas (tx-ops->deltas tx-ops)
 
         ;; 4. Process each affected query

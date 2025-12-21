@@ -179,11 +179,12 @@
 ;;;; Naive Implementation Framework
 
 (defn naive-fetch-all
-  "Fetch all documents from a table in XTDB using SQL."
+  "Fetch all documents from a table using XTQL.
+
+  Returns all documents sorted by :xt/id for deterministic ordering."
   [xtdb-client table]
-  (let [sql (str "SELECT * FROM " (name table))
-        results (xt/q xtdb-client sql)]
-    results))
+  (let [results (xt/q xtdb-client (list 'from table ['*]))]
+    (vec (sort-by :xt/id results))))
 
 (defn fetch-all-orders
   "Fetch all orders from XTDB."
@@ -305,8 +306,10 @@
   "Clear all documents from a table."
   [xtdb-client table]
   (try
-    (xt/execute-tx xtdb-client
-                   [[:sql (str "DELETE FROM " (name table))]])
+    (let [ids (map :xt/id (xt/q xtdb-client (list 'from table ['xt/id])))]
+      (when (seq ids)
+        (xt/execute-tx xtdb-client
+                       [(into [:delete-docs table] ids)])))
     (catch Exception _
       ;; Table might not exist yet, that's okay
       nil)))

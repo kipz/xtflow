@@ -818,7 +818,8 @@
     (let [doc (:doc delta)
           mult (:mult delta)
           ;; Convert symbols to keywords since parser may use symbols
-          fields-to-remove (set (map #(if (symbol? %) (keyword %) %) fields))
+          ;; Use vec to ensure it's a sequence for apply dissoc
+          fields-to-remove (vec (distinct (map #(if (symbol? %) (keyword %) %) fields)))
           result (apply dissoc doc fields-to-remove)]
       [(delta/make-delta result mult)]))
 
